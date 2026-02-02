@@ -1,0 +1,3 @@
+__pycache__/
+*.db
+clinical_ehr.db
