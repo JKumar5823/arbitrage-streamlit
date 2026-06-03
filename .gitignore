@@ -1,0 +1,8 @@
+# PitchBook Capture Room
+.env
+pitchbook.db
+captures/
+__pycache__/
+*.pyc
+.venv/
+venv/

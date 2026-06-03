@@ -3,3 +3,15 @@ pandas
 beautifulsoup4
 requests
 openpyxl
+
+# --- PitchBook Capture Room ---
+# Cursor control + screen capture (run on your laptop)
+pyautogui
+mss
+pillow
+# Extraction
+anthropic
+pytesseract
+# Cloud SQL storage
+sqlalchemy
+psycopg2-binary
