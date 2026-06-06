@@ -35,14 +35,33 @@ tidy "long" row per logged set.
 - `workout/physique.py` — local photo store + lift correlation.
 - `app.py` — the Streamlit UI.
 
-## Refreshing your data
+## Keeping it in sync with your sheet
 
 The repo bundles a snapshot containing **only** the three workout-relevant tabs
 (`Routine`, `Daily Wgt`, `PRs`) — your financial / personal tabs are deliberately
-**not** included. To update with new training data:
+**not** included. The app resolves its data source in this priority order:
+**manual upload → live Google Sheets sync → bundled snapshot.**
 
-1. In Google Sheets: **File → Download → Microsoft Excel (.xlsx)**
-2. In the app sidebar: **📂 Data source → Upload updated .xlsx**
+### 🔗 Live sync (recommended) — edit the sheet, the app updates
+
+Reads the latest workout tabs straight from your Google Sheet via a **service
+account**, so the sheet stays fully private. One-time setup:
+
+1. **Google Cloud Console** → create/select a project → enable the **Google Sheets API**.
+2. Create a **Service Account** → *Keys* → *Add key* → **JSON**; download it.
+3. Open your Life Dashboard sheet → **Share** → add the service account's
+   `client_email` (e.g. `lift-lab@my-project.iam.gserviceaccount.com`) as **Viewer**.
+4. Copy `.streamlit/secrets.toml.example` → `.streamlit/secrets.toml` and paste in
+   the JSON fields + your `sheet_id`. (`secrets.toml` is git-ignored.)
+
+Then the sidebar shows **🔗 Google Sheets live sync** — leave it on and the app
+pulls fresh data (cached ~5 min; **🔄 Refresh now** pulls immediately, **🧪 Test
+connection** verifies access). Now whenever you edit the sheet, just refresh.
+
+### ⬆️ Manual upload (no setup)
+
+In Google Sheets: **File → Download → Microsoft Excel (.xlsx)**, then in the app
+sidebar **📂 Data source → Upload updated .xlsx**.
 
 (Physique photos you upload stay local in `data/physique/` and are git-ignored.)
 

@@ -46,11 +46,40 @@ def _load_from_path(path: str, mtime: float):
     return ds.routine, ds.daily, ds.prs
 
 
+@st.cache_data(ttl=300, show_spinner="Syncing from Google Sheets…")
+def _load_live(sheet_id: str, _creds: dict, nonce: int):
+    """Live read from Google Sheets. ``nonce`` lets the UI force a refresh; ``_creds``
+    is underscore-prefixed so Streamlit doesn't try to hash the credentials dict."""
+    from workout import gsheets
+    ds = gsheets.load_dataset_live(sheet_id, _creds)
+    return ds.routine, ds.daily, ds.prs
+
+
+def gsheets_configured() -> bool:
+    try:
+        return bool(st.secrets.get("sheet_id")) and "gcp_service_account" in st.secrets
+    except Exception:
+        return False
+
+
 def get_dataset():
+    """Resolve the active data source. Priority: manual upload > live sync > snapshot."""
     src = st.session_state.get("uploaded_bytes")
     if src is not None:
+        st.session_state["active_source"] = "upload"
         return _load_from_bytes(src)
+    if st.session_state.get("use_live") and gsheets_configured():
+        try:
+            creds = dict(st.secrets["gcp_service_account"])
+            data = _load_live(st.secrets["sheet_id"], creds,
+                              st.session_state.get("live_nonce", 0))
+            st.session_state["active_source"] = "live"
+            return data
+        except Exception as exc:  # fall back to snapshot but tell the user
+            st.session_state["live_error"] = str(exc)
+            st.session_state["active_source"] = "bundled"
     if DATA_PATH.exists():
+        st.session_state.setdefault("active_source", "bundled")
         return _load_from_path(str(DATA_PATH), DATA_PATH.stat().st_mtime)
     return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
@@ -62,19 +91,54 @@ def get_dataset():
 st.sidebar.title("🏋️ Lift Lab")
 st.sidebar.caption("Your training, decoded.")
 
+# Auto-enable live sync the first time we see configured secrets.
+if gsheets_configured():
+    st.session_state.setdefault("use_live", True)
+
 with st.sidebar.expander("📂 Data source", expanded=False):
-    st.write("Using the bundled snapshot of your **Life Dashboard** sheet. "
-             "To refresh, export the sheet as `.xlsx` (File → Download → "
-             "Microsoft Excel) and upload it here.")
+    if gsheets_configured():
+        st.markdown("**🔗 Google Sheets live sync**")
+        st.session_state["use_live"] = st.toggle(
+            "Sync live from my sheet", value=st.session_state.get("use_live", True),
+            help="Reads the latest Routine / Daily Wgt / PRs straight from your sheet.")
+        cols = st.columns(2)
+        if cols[0].button("🔄 Refresh now", width="stretch"):
+            st.session_state["live_nonce"] = st.session_state.get("live_nonce", 0) + 1
+            st.cache_data.clear()
+            st.rerun()
+        if cols[1].button("🧪 Test connection", width="stretch"):
+            from workout import gsheets
+            ok, msg = gsheets.connection_check(
+                st.secrets["sheet_id"], dict(st.secrets["gcp_service_account"]))
+            (st.success if ok else st.error)(msg)
+        st.caption("Live data is cached ~5 min; **Refresh now** pulls immediately.")
+        st.divider()
+    else:
+        st.info("💡 Want it to **auto-update** when you edit the sheet? Set up a Google "
+                "service account and add it to `.streamlit/secrets.toml` "
+                "(see `secrets.toml.example` / the README). Until then, upload manually below.")
+
+    st.markdown("**⬆️ Manual upload** (overrides live)")
+    st.caption("Export the sheet as `.xlsx` (File → Download → Microsoft Excel) and drop it here.")
     up = st.file_uploader("Upload updated .xlsx", type=["xlsx"])
     if up is not None:
         st.session_state["uploaded_bytes"] = up.getvalue()
-        st.success("Loaded your uploaded file.")
-    if st.session_state.get("uploaded_bytes") and st.button("Revert to bundled snapshot"):
+        st.success("Using your uploaded file.")
+    if st.session_state.get("uploaded_bytes") and st.button("Use live / snapshot instead"):
         st.session_state.pop("uploaded_bytes", None)
         st.rerun()
 
 routine, daily, prs = get_dataset()
+
+# Surface the active source + any live-sync error.
+_src = st.session_state.get("active_source", "bundled")
+_src_label = {"live": "🟢 Live from Google Sheets", "upload": "📄 Uploaded file",
+              "bundled": "📦 Bundled snapshot"}.get(_src, _src)
+st.sidebar.caption(f"Source: {_src_label}")
+if st.session_state.get("live_error") and _src != "live":
+    st.sidebar.warning("Live sync failed, showing snapshot. "
+                       f"{st.session_state['live_error'][:160]}")
+    st.session_state.pop("live_error", None)
 
 if routine.empty:
     st.error("No workout data found. Upload your Life Dashboard .xlsx in the sidebar.")

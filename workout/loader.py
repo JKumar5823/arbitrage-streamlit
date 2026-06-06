@@ -188,8 +188,7 @@ def _is_header(row: list) -> bool:
     return len(row) > 0 and _clean_str(row[0]).lower() == "date"
 
 
-def parse_routine(wb: openpyxl.Workbook) -> pd.DataFrame:
-    rows = _sheet_rows(wb, "Routine")
+def parse_routine(rows: list[list]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
 
@@ -313,8 +312,7 @@ _DAILY_MAP = {
 }
 
 
-def parse_daily_wgt(wb: openpyxl.Workbook) -> pd.DataFrame:
-    rows = _sheet_rows(wb, "Daily Wgt")
+def parse_daily_wgt(rows: list[list]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     header = [_clean_str(c) for c in rows[0]]
@@ -351,9 +349,8 @@ def parse_daily_wgt(wb: openpyxl.Workbook) -> pd.DataFrame:
 # PRs tab (rep-max matrix)
 # ---------------------------------------------------------------------------
 
-def parse_prs(wb: openpyxl.Workbook) -> pd.DataFrame:
+def parse_prs(rows: list[list]) -> pd.DataFrame:
     """Return long DataFrame [exercise, reps, weight] from the logged rep-max matrix."""
-    rows = _sheet_rows(wb, "PRs")
     if not rows:
         return pd.DataFrame()
     header = [_clean_str(c) for c in rows[0]]
@@ -407,10 +404,27 @@ class Dataset:
     prs: pd.DataFrame
 
 
-def load_dataset(path_or_buffer) -> Dataset:
-    wb = load_workbook(path_or_buffer)
+# canonical sheet/tab names we read
+ROUTINE_SHEET = "Routine"
+DAILY_SHEET = "Daily Wgt"
+PRS_SHEET = "PRs"
+
+
+def build_dataset(sheets: dict[str, list[list]]) -> Dataset:
+    """Build a Dataset from a mapping of {sheet_name: rows} (rows = list of lists).
+
+    This is the single source-agnostic entry point: the same parsing logic serves
+    an .xlsx upload, the bundled snapshot, or a live Google Sheets read.
+    """
     return Dataset(
-        routine=parse_routine(wb),
-        daily=parse_daily_wgt(wb),
-        prs=parse_prs(wb),
+        routine=parse_routine(sheets.get(ROUTINE_SHEET, [])),
+        daily=parse_daily_wgt(sheets.get(DAILY_SHEET, [])),
+        prs=parse_prs(sheets.get(PRS_SHEET, [])),
     )
+
+
+def load_dataset(path_or_buffer) -> Dataset:
+    """Load from an .xlsx path or bytes/file-like buffer."""
+    wb = load_workbook(path_or_buffer)
+    sheets = {name: _sheet_rows(wb, name) for name in wb.sheetnames}
+    return build_dataset(sheets)
