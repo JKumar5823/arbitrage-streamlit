@@ -1,0 +1,9 @@
+# Personal physique photos (uploaded at runtime) — never commit
+data/physique/*
+!data/physique/.gitkeep
+
+# Scratch / derived
+data/csv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
