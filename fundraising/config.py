@@ -137,6 +137,10 @@ REVIEW_PENDING = "pending"
 REVIEW_ACCEPTED = "accepted"
 REVIEW_IGNORED = "ignored"
 
+KIND_MEETING = "meeting"   # a conversation that actually took place
+KIND_STAGE = "stage"       # a pipeline transition, for the funnel only
+
 SOURCE_MANUAL = "manual"
 SOURCE_CALENDAR = "calendar"
 SOURCE_SHEET = "sheet"
+SOURCE_WORKBOOK = "workbook"

@@ -338,3 +338,41 @@ def sparkline(data: pd.DataFrame, mode: str | None = None, height: int = 44) -> 
         .properties(height=height)
         .configure_view(strokeWidth=0, fill=colors["surface"])
     )
+
+
+def lead_funnel_chart(data: pd.DataFrame, mode: str | None = None,
+                      height: int | None = None) -> alt.Chart:
+    """Leads reaching each canonical step, with step-to-step conversion.
+
+    One hue: the funnel's order is carried by bar position and direct labels,
+    and bar length already encodes the count.
+    """
+    mode = mode or active_mode()
+    colors = palette(mode)
+    if data.empty or data["leads"].sum() == 0:
+        return _empty("No pipeline imported yet", mode)
+
+    order = data.sort_values("rank")["label"].tolist()
+    frame = data.copy()
+    frame["caption"] = frame.apply(
+        lambda r: f"{int(r['leads']):,}   {r['conversion']:.0%}", axis=1)
+    height = height or max(220, 34 * len(frame) + 30)
+
+    bars = alt.Chart(frame).mark_bar(
+        color=colors["series"], cornerRadiusEnd=4,
+    ).encode(
+        y=alt.Y("label:N", sort=order, title=None,
+                scale=alt.Scale(paddingInner=0.34, paddingOuter=0.16),
+                axis=alt.Axis(labelLimit=150)),
+        x=alt.X("leads:Q", title="Leads reaching this step",
+                axis=alt.Axis(grid=True, tickCount=5, format="d")),
+        tooltip=[alt.Tooltip("label:N", title="Step"),
+                 alt.Tooltip("leads:Q", title="Leads", format=","),
+                 alt.Tooltip("conversion:Q", title="From previous step", format=".0%"),
+                 alt.Tooltip("share:Q", title="Of all outreach", format=".0%"),
+                 alt.Tooltip("rule:N", title="Counted as")],
+    )
+    labels = alt.Chart(frame).mark_text(
+        align="left", dx=6, font=FONT, fontSize=11, color=colors["secondary"],
+    ).encode(y=alt.Y("label:N", sort=order), x=alt.X("leads:Q"), text="caption:N")
+    return _style((bars + labels).properties(height=height), mode)

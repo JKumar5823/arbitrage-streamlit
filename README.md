@@ -39,14 +39,91 @@ that were really fundraising conversations. That is what keeps the numbers
 defensible — and it means a wrong call tells you exactly which keyword or
 investor domain to fix in **Data & Settings**.
 
-**Absorbs your Google Sheet.** Load it by link, through a service account, or by
-uploading a file. The app guesses which of your columns feeds which field, you
-confirm the mapping, and you get a full dry run — how many rows are new, how
+**Absorbs the master workbook.** The FUIFOAA workbook is not a flat log: one row
+is one *lead*, and roughly forty dated columns record when that lead entered each
+stage. Point the importer at the file and it reads all 13 campaign sheets, the
+lead directory behind them, and the Google Calendar sync bundled in
+`Exp_Calendar`. See [The master workbook](#the-master-workbook) below.
+
+**Absorbs a plain Google Sheet too.** Load it by link, through a service account,
+or by uploading a file. The app guesses which of your columns feeds which field,
+you confirm the mapping, and you get a full dry run — how many rows are new, how
 many update existing ones, and which rows cannot be imported and why, named by
 their spreadsheet row number — before anything is written.
 
 Then **Adopt as system of record** stamps the cutover date, shows a banner
 across the app, and gives you the note to paste at the top of the old sheet.
+
+## The master workbook
+
+### What it reads
+
+| Workbook shape | Becomes |
+| --- | --- |
+| One row per lead, across 13 campaign sheets | A `leads` row with grade, firm, connector, owner and furthest stage reached |
+| A dated stage column (`4.1. 1st Meeting Happened`) | A `stage` event — these build the funnel |
+| `1st…4th Meeting Date` | A `meeting` event — these are the conversations that get counted |
+| `Exp_Calendar` | Calendar events, ready for the review queue |
+
+Stage events and meetings are stored separately and counted separately, so a
+pipeline transition is never mistaken for a conversation.
+
+### One vocabulary out of eighty-nine labels
+
+Each campaign type words its stages differently — a webinar raise says
+`4.1 Attended Webinar/Met` where an intro raise says `4.1. 1st Meeting Happened`
+and the hiring pipeline says `4. 1st Interview Happened`. All 89 labels are
+mapped onto ten canonical steps in `fundraising/pipeline.py`.
+
+Mapping is by **label, never by the numeric prefix**: `3.2` means *Interested* on
+an intro raise but *Invited to Webinar* on a webinar raise. Two consequences
+worth knowing:
+
+* `3.3. Scheduling 1st Meeting` counts as *Interested*, not *Meeting Scheduled* —
+  scheduling is an intent, only `3.4` is a booked meeting.
+* `0. Attended - Bad Fit For Client` still counts as a meeting that happened.
+  A conversation that ended badly was still a conversation.
+
+A stage label the mapping does not recognise is **reported, never silently
+dropped** — the import screen lists it, because an unmapped stage would quietly
+sink its leads down the funnel.
+
+### How the funnel is counted
+
+Each lead sits at the furthest stage it reached, taken from its dated stage
+columns and its current status. The funnel is therefore monotone: a lead that
+passed after a first meeting still counts as having had that meeting. Each step
+states its own rule in the UI.
+
+### How it compares to the workbook's own daily report
+
+Reproducing the report's figures was the acceptance test. The BD group matches
+exactly, and Closed Won matches exactly across every group; intro/interested/
+verbal land within a few percent. Two steps differ more:
+
+| Step | This app | Daily report |
+| --- | --- | --- |
+| Outreach (FUIFOAA) | 512 | 659 |
+| Meeting Scheduled (FUIFOAA) | 179 | 165 |
+| Meeting Happened (FUIFOAA) | 152 | 132 |
+
+The report's exact edge rules are not visible in the workbook, so rather than
+bit-match an opaque snapshot the app applies the documented rule above. If you
+want a step counted differently, change its rank in `fundraising/pipeline.py` —
+that is the single place the funnel is defined.
+
+### Conversations you have had, not ones you have booked
+
+The workbook holds meetings dated in the future. Those are excluded from the
+conversation count and reported separately, because a meeting on next Thursday
+is on the books, not in the total.
+
+### What is not migrated
+
+The workbook's own machinery — `Daily Report`, `_Change Log`, `_Ambiguity Log`,
+`_Hold Log`, `_Portal-Log`, `_KPI Calc`, `Validations`, `Connectors` and the
+blacklists — is workbook plumbing rather than pipeline data, and is left where it
+is. The app imports the campaign sheets and the calendar.
 
 ## Why re-importing is safe
 
@@ -88,12 +165,14 @@ read-only scopes and share the specific calendars and sheets with its
 | --- | --- |
 | `app.py` | Streamlit UI: the six tabs and their wiring |
 | `fundraising/db.py` | SQLite schema, CRUD and the audit log |
+| `fundraising/pipeline.py` | The 89-label stage taxonomy and the canonical funnel |
+| `fundraising/workbook.py` | The master-workbook adapter |
 | `fundraising/calendars.py` | Calendar ingestion and the meeting classifier |
 | `fundraising/sheets.py` | Sheet loading, column mapping, import, subsumption |
 | `fundraising/metrics.py` | Derived views — KPIs, funnel, volume, heatmap |
 | `fundraising/charts.py` | Altair charts and the colour palette |
 | `fundraising/seed.py` | Demo data |
-| `tests/` | `pytest` suite (89 tests) |
+| `tests/` | `pytest` suite (123 tests) |
 | `legacy_arbitrage_app.py` | The repo's previous arbitrage scraper, kept as-is |
 
 ```bash

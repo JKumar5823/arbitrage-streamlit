@@ -124,7 +124,7 @@ def seed_demo(path=None, today: date | None = None, seed: int = 7) -> dict[str, 
 def reset(path=None) -> None:
     """Drop all operational rows. Settings and schema survive."""
     with db._WRITE_LOCK, db.session(path) as conn:
-        for table in ("calendar_events", "conversations", "import_batches",
+        for table in ("calendar_events", "conversations", "leads", "import_batches",
                       "investors", "people", "audit_log"):
             conn.execute(f"DELETE FROM {table}")
         db.log(conn, "database", None, "reset")

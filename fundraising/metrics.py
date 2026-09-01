@@ -13,7 +13,7 @@ from typing import Sequence
 
 import pandas as pd
 
-from . import config
+from . import config, pipeline
 
 # The funnel's depth axis. "Passed" is an exit, not a depth -- an investor who
 # passed after a first meeting got no further than a first meeting -- so it is
@@ -71,6 +71,20 @@ def apply_filters(df: pd.DataFrame, *, start: date | None = None, end: date | No
 
 # --- Headline numbers --------------------------------------------------------
 
+def split_by_today(df: pd.DataFrame, today: date | None = None
+                   ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Separate conversations already had from meetings still to come.
+
+    A meeting on next Thursday is on the books, not in the count -- the whole
+    question is how many conversations the team *has had*.
+    """
+    if df.empty:
+        return df, df
+    stamp = pd.Timestamp(today or date.today())
+    occurred = pd.to_datetime(df["occurred_on"], errors="coerce")
+    return df[occurred <= stamp], df[occurred > stamp]
+
+
 @dataclass
 class Kpis:
     total: int = 0
@@ -86,6 +100,7 @@ class Kpis:
     committed_amount: float = 0.0
     pipeline_amount: float = 0.0
     overdue_next_steps: int = 0
+    upcoming: int = 0
     first_date: pd.Timestamp | None = None
     last_date: pd.Timestamp | None = None
 
@@ -99,11 +114,18 @@ def compute_kpis(df: pd.DataFrame, today: date | None = None) -> Kpis:
         return Kpis()
     today = today or date.today()
     now = pd.Timestamp(today)
+    # Only conversations that have actually happened count; scheduled ones are
+    # reported separately so they are visible without inflating the total.
+    df, ahead = split_by_today(df, today)
+    upcoming = int(len(ahead))
+    if df.empty:
+        return Kpis(upcoming=upcoming)
     occurred = pd.to_datetime(df["occurred_on"], errors="coerce")
     valid = df[occurred.notna()].copy()
     valid["_d"] = occurred[occurred.notna()]
 
     kpis = Kpis(
+        upcoming=upcoming,
         total=int(len(df)),
         investors=int(df["investor"].dropna().nunique()),
         people=int(df["person"].dropna().nunique()),
@@ -318,3 +340,124 @@ def upcoming_next_steps(df: pd.DataFrame, today: date | None = None,
     return (work[columns]
             .sort_values("next_step_due", na_position="last")
             .reset_index(drop=True))
+
+
+# --- Workbook pipeline (lead-based) -----------------------------------------
+#
+# The FUIFOAA workbook tracks one row per lead with dated stage columns, so its
+# funnel is computed over leads and their furthest stage reached -- not over the
+# conversation log. These functions take the leads frame.
+
+
+def filter_leads(leads: pd.DataFrame, *, groups: Sequence[str] | None = None,
+                 sheets: Sequence[str] | None = None,
+                 owners: Sequence[str] | None = None,
+                 grades: Sequence[str] | None = None,
+                 include_terminal: bool = True) -> pd.DataFrame:
+    if leads.empty:
+        return leads
+    out = leads
+    if groups:
+        out = out[out["campaign_group"].isin(list(groups))]
+    if sheets:
+        out = out[out["sheet"].isin(list(sheets))]
+    if owners:
+        out = out[out["owner"].isin(list(owners))]
+    if grades:
+        out = out[out["grade"].isin(list(grades))]
+    if not include_terminal:
+        out = out[out["terminal"].isna()]
+    return out
+
+
+def lead_funnel(leads: pd.DataFrame) -> pd.DataFrame:
+    """Leads reaching each canonical step, monotone by furthest stage reached.
+
+    A lead that passed after a first meeting still counts as having reached the
+    first meeting -- the funnel measures depth, not current state.
+    """
+    columns = ["step", "label", "rank", "leads", "share", "conversion", "rule"]
+    if leads.empty:
+        return pd.DataFrame({c: pd.Series(dtype="object") for c in columns})
+
+    ranks = pd.to_numeric(leads["status_rank"], errors="coerce").fillna(0)
+    top = int((ranks >= pipeline.STEP_BY_KEY["outreach"].rank).sum())
+
+    rows, previous = [], None
+    for step in pipeline.STEPS:
+        if step.key == "targeting":
+            continue          # every lead is at least targeted; not a funnel gate
+        reached = int((ranks >= step.rank).sum())
+        rows.append({
+            "step": step.key,
+            "label": step.label,
+            "rank": step.rank,
+            "leads": reached,
+            "share": round(reached / top, 4) if top else 0.0,
+            # Step-to-step conversion is what the team actually manages.
+            "conversion": round(reached / previous, 4) if previous else 1.0,
+            "rule": pipeline.STEP_RULES.get(step.key, ""),
+        })
+        previous = reached or None
+    return pd.DataFrame(rows, columns=columns)
+
+
+def lead_outcomes(leads: pd.DataFrame) -> dict[str, int]:
+    if leads.empty:
+        return {"live": 0, "lost": 0, "hold": 0, "won": 0}
+    ranks = pd.to_numeric(leads["status_rank"], errors="coerce").fillna(0)
+    terminal = leads["terminal"]
+    won = int((ranks >= pipeline.STEP_BY_KEY["won"].rank).sum())
+    lost = int((terminal == pipeline.LOST).sum())
+    hold = int((terminal == pipeline.HOLD).sum())
+    return {"live": int(len(leads) - lost - hold - won),
+            "lost": lost, "hold": hold, "won": won}
+
+
+def meetings_only(conversations: pd.DataFrame) -> pd.DataFrame:
+    """Just the conversations that actually happened.
+
+    Workbook imports also store stage transitions in this table; those drive the
+    funnel and must never be counted as conversations.
+    """
+    if conversations.empty or "kind" not in conversations.columns:
+        return conversations
+    return conversations[conversations["kind"].fillna(config.KIND_MEETING)
+                         == config.KIND_MEETING]
+
+
+def by_campaign(leads: pd.DataFrame) -> pd.DataFrame:
+    """Per-campaign roll-up: how deep each pipeline has got."""
+    columns = ["campaign_group", "sheet", "leads", "met", "won", "lost", "live"]
+    if leads.empty:
+        return pd.DataFrame({c: pd.Series(dtype="object") for c in columns})
+    ranks = pd.to_numeric(leads["status_rank"], errors="coerce").fillna(0)
+    work = leads.assign(_rank=ranks)
+    rows = []
+    for (group, sheet), chunk in work.groupby(["campaign_group", "sheet"], sort=True):
+        outcomes = lead_outcomes(chunk)
+        rows.append({
+            "campaign_group": group, "sheet": sheet, "leads": int(len(chunk)),
+            "met": int((chunk["_rank"] >= pipeline.STEP_BY_KEY["attended"].rank).sum()),
+            "won": outcomes["won"], "lost": outcomes["lost"], "live": outcomes["live"],
+        })
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["campaign_group", "leads"], ascending=[True, False]).reset_index(drop=True)
+
+
+def top_connectors(leads: pd.DataFrame, limit: int = 15) -> pd.DataFrame:
+    """Who is actually opening doors -- intros that reached a meeting."""
+    columns = ["connector", "leads", "met", "hit_rate"]
+    if leads.empty or leads["connector"].dropna().empty:
+        return pd.DataFrame({c: pd.Series(dtype="object") for c in columns})
+    ranks = pd.to_numeric(leads["status_rank"], errors="coerce").fillna(0)
+    work = leads.assign(_rank=ranks)
+    work = work[work["connector"].notna()]
+    rows = []
+    for connector, chunk in work.groupby("connector", sort=False):
+        met = int((chunk["_rank"] >= pipeline.STEP_BY_KEY["attended"].rank).sum())
+        rows.append({"connector": connector, "leads": int(len(chunk)), "met": met,
+                     "hit_rate": round(met / len(chunk), 3)})
+    return (pd.DataFrame(rows, columns=columns)
+            .sort_values(["met", "leads"], ascending=False)
+            .head(limit).reset_index(drop=True))

@@ -19,7 +19,8 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 import streamlit as st
 
-from fundraising import calendars, charts, config, db, metrics, seed, sheets, util
+from fundraising import (calendars, charts, config, db, metrics, pipeline,
+                         seed, sheets, util, workbook)
 
 st.set_page_config(page_title=config.APP_TITLE, page_icon=config.APP_ICON,
                    layout="wide", initial_sidebar_state="expanded")
@@ -75,13 +76,22 @@ def money(value: float | None) -> str:
 db.init_db()
 settings = db.all_settings()
 
+conversations_all = db.list_conversations()
+people_frame = db.list_people()
+investors_frame = db.list_investors()
+leads_all = db.list_leads()
+has_pipeline = not leads_all.empty
+
 with st.sidebar:
     st.markdown(f"### {config.APP_ICON} {config.APP_TITLE}")
     row_counts = db.counts()
+    held, booked = metrics.split_by_today(metrics.meetings_only(conversations_all))
     st.caption(
-        f"{row_counts['conversations']} conversations · "
-        f"{row_counts['investors']} investors · {row_counts['people']} people"
+        f"{len(held):,} conversations · {row_counts['leads']:,} leads · "
+        f"{row_counts['investors']:,} firms · {row_counts['people']} people"
     )
+    if len(booked):
+        st.caption(f"{len(booked):,} more meetings are booked but not yet held.")
     if sheets.is_system_of_record():
         adopted = str(settings.get(config.S_SOR_ADOPTED_AT))[:10]
         st.success(f"System of record since {adopted}", icon=":material/verified:")
@@ -98,10 +108,6 @@ with st.sidebar:
             seed.seed_demo()
             st.rerun()
 
-conversations_all = db.list_conversations()
-people_frame = db.list_people()
-investors_frame = db.list_investors()
-
 st.title(f"{config.APP_ICON} Fundraising Conversations")
 
 # --- One filter row, above everything it scopes ------------------------------
@@ -109,11 +115,15 @@ st.title(f"{config.APP_ICON} Fundraising Conversations")
 if conversations_all.empty:
     default_start, default_end = date.today() - timedelta(days=90), date.today()
 else:
-    dates = pd.to_datetime(conversations_all["occurred_on"], errors="coerce").dropna()
-    default_start = dates.min().date() if not dates.empty else date.today() - timedelta(days=90)
-    default_end = max(dates.max().date(), date.today()) if not dates.empty else date.today()
+    dates = pd.to_datetime(
+        metrics.meetings_only(conversations_all)["occurred_on"], errors="coerce").dropna()
+    default_start = (dates.min().date() if not dates.empty
+                     else date.today() - timedelta(days=90))
+    # Ends today, not at the last record: meetings booked for next month have
+    # not been had yet, so the default view is what actually happened.
+    default_end = date.today()
 
-f1, f2, f3, f4 = st.columns([2.2, 1.4, 1.4, 1.6])
+f1, f2, f3, f4 = st.columns([2.1, 1.5, 1.5, 1.5])
 with f1:
     date_range = st.date_input("Date range", value=(default_start, default_end),
                                format="YYYY-MM-DD")
@@ -121,21 +131,43 @@ with f2:
     people_filter = st.multiselect(
         "Team member", sorted(conversations_all["person"].dropna().unique().tolist()))
 with f3:
-    stage_filter = st.multiselect("Stage", config.STAGES)
+    if has_pipeline:
+        available_groups = [g for g in pipeline.CAMPAIGN_GROUPS
+                            if g in set(leads_all["campaign_group"].dropna())]
+        # Hiring and BD conversations are not fundraising conversations, so the
+        # dashboard opens on the raises and lets you widen from there.
+        group_filter = st.multiselect(
+            "Campaign", available_groups,
+            default=[g for g in available_groups if g != "BD & hiring"])
+    else:
+        group_filter = []
+        stage_filter_fallback = st.multiselect("Stage", config.STAGES)
 with f4:
-    search_text = st.text_input("Search", placeholder="Investor, contact, note…")
+    search_text = st.text_input("Search", placeholder="Firm, contact, note…")
+
+stage_filter = [] if has_pipeline else locals().get("stage_filter_fallback", [])
 
 start_date = date_range[0] if isinstance(date_range, (tuple, list)) and date_range else None
 end_date = (date_range[1] if isinstance(date_range, (tuple, list)) and len(date_range) > 1
             else None)
 
-view = metrics.apply_filters(conversations_all, start=start_date, end=end_date,
+# Workbook imports also store stage transitions in this table. They drive the
+# funnel; only 'meeting' rows are conversations the team actually had.
+meetings_all = metrics.meetings_only(conversations_all)
+view = metrics.apply_filters(meetings_all, start=start_date, end=end_date,
                              people=people_filter, stages=stage_filter,
                              search=search_text)
+if has_pipeline and group_filter and "campaign_group" in view.columns:
+    view = view[view["campaign_group"].isin(group_filter)
+                | view["campaign_group"].isna()]
 
-tab_overview, tab_log, tab_calendar, tab_import, tab_directory, tab_data = st.tabs(
-    ["Overview", "Conversations", "Calendars", "Import & Sources", "Directory",
-     "Data & Settings"]
+leads_view = metrics.filter_leads(leads_all, groups=group_filter or None,
+                                  owners=people_filter or None)
+
+(tab_overview, tab_pipeline, tab_log, tab_calendar, tab_import, tab_directory,
+ tab_data) = st.tabs(
+    ["Overview", "Pipeline", "Conversations", "Calendars", "Import & Sources",
+     "Directory", "Data & Settings"]
 )
 
 
@@ -147,17 +179,43 @@ with tab_overview:
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Conversations", f"{kpis.total:,}",
               delta=f"{kpis.week_delta:+d} vs prior week" if kpis.total else None,
-              help="Every logged fundraising conversation in the current filter.")
-    k2.metric("Investors engaged", f"{kpis.investors:,}",
-              help="Distinct investors with at least one conversation.")
-    k3.metric("Live pipeline", f"{kpis.in_flight:,}",
-              help="Investors who have neither committed nor passed.")
-    k4.metric("Committed", f"{kpis.committed:,}",
-              delta=money(kpis.committed_amount) if kpis.committed_amount else None,
-              delta_color="off")
+              help="Meetings that actually happened, in the current filter. "
+                   "Pipeline stage changes are not counted here.")
+    if has_pipeline:
+        outcomes = metrics.lead_outcomes(leads_view)
+        met = int((pd.to_numeric(leads_view["status_rank"], errors="coerce").fillna(0)
+                   >= pipeline.STEP_BY_KEY["attended"].rank).sum()) if not leads_view.empty else 0
+        k2.metric("Leads met", f"{met:,}",
+                  help="Distinct leads the team has actually sat down with.")
+        k3.metric("Live pipeline", f"{outcomes['live']:,}",
+                  delta=f"{outcomes['hold']} on hold" if outcomes["hold"] else None,
+                  delta_color="off",
+                  help="Leads that have neither closed nor been lost.")
+        k4.metric("Closed won", f"{outcomes['won']:,}",
+                  delta=money(kpis.committed_amount) if kpis.committed_amount else None,
+                  delta_color="off")
+    else:
+        k2.metric("Investors engaged", f"{kpis.investors:,}",
+                  help="Distinct investors with at least one conversation.")
+        k3.metric("Live pipeline", f"{kpis.in_flight:,}",
+                  help="Investors who have neither committed nor passed.")
+        k4.metric("Committed", f"{kpis.committed:,}",
+                  delta=money(kpis.committed_amount) if kpis.committed_amount else None,
+                  delta_color="off")
     k5.metric("Conversations / week", f"{kpis.weekly_average:g}",
               delta=f"{kpis.last_7} in last 7 days" if kpis.total else None,
               delta_color="off")
+
+    # Counted from the unfiltered log: the date filter already ends today, so
+    # anything still to come would otherwise be invisible here.
+    scoped = meetings_all
+    if has_pipeline and group_filter and "campaign_group" in scoped.columns:
+        scoped = scoped[scoped["campaign_group"].isin(group_filter)
+                        | scoped["campaign_group"].isna()]
+    booked_ahead = metrics.split_by_today(scoped)[1]
+    if not booked_ahead.empty:
+        st.caption(f"{len(booked_ahead)} further meetings are already booked but "
+                   "have not happened yet, so they are not counted above.")
 
     target = settings.get(config.S_TARGET_CONVERSATIONS)
     if target and kpis.total:
@@ -183,12 +241,22 @@ with tab_overview:
     left, right = st.columns(2)
     with left:
         st.subheader("Pipeline funnel")
-        st.caption("Investors that reached each stage. A pass counts at the depth "
-                   "reached before the pass, not below it.")
-        funnel_frame = metrics.funnel(view)
-        chart(charts.funnel_chart(funnel_frame), key="funnel")
-        table_view(funnel_frame.drop(columns=["order"]) if not funnel_frame.empty
-                   else funnel_frame)
+        if has_pipeline:
+            st.caption("Leads reaching each step, by the furthest stage they got "
+                       "to. A lead that passed after a first meeting still counts "
+                       "as having had that meeting.")
+            funnel_frame = metrics.lead_funnel(leads_view)
+            chart(charts.lead_funnel_chart(funnel_frame), key="funnel",
+                  height=max(260, 34 * len(funnel_frame) + 70))
+            table_view(funnel_frame[["label", "leads", "conversion", "share", "rule"]]
+                       if not funnel_frame.empty else funnel_frame)
+        else:
+            st.caption("Investors that reached each stage. A pass counts at the "
+                       "depth reached before the pass, not below it.")
+            funnel_frame = metrics.funnel(view)
+            chart(charts.funnel_chart(funnel_frame), key="funnel")
+            table_view(funnel_frame.drop(columns=["order"]) if not funnel_frame.empty
+                       else funnel_frame)
     with right:
         st.subheader("Who is having the conversations")
         per_person = metrics.by_person(view)
@@ -236,6 +304,143 @@ with tab_overview:
                     "days_since": st.column_config.NumberColumn("Days since contact"),
                     "conversations": st.column_config.NumberColumn("Convos"),
                 })
+
+
+# --- Pipeline ----------------------------------------------------------------
+
+with tab_pipeline:
+    if not has_pipeline:
+        st.info("No lead pipeline imported yet. Load the master workbook under "
+                "**Import & Sources** to see campaigns, connectors and the "
+                "stage-by-stage funnel here.", icon=":material/upload_file:")
+    else:
+        st.subheader("Where every lead stands")
+        st.caption(f"{len(leads_view):,} leads in the current filter. Each lead's "
+                   "position is the furthest stage it reached, taken from the "
+                   "dated stage columns in the workbook.")
+
+        funnel_frame = metrics.lead_funnel(leads_view)
+        left, right = st.columns([1.25, 1])
+        with left:
+            chart(charts.lead_funnel_chart(funnel_frame), key="pipeline_funnel",
+                  height=max(300, 34 * len(funnel_frame) + 70))
+        with right:
+            st.markdown("**How each step is counted**")
+            st.dataframe(
+                funnel_frame[["label", "leads", "conversion", "rule"]],
+                width=STRETCH, hide_index=True,
+                column_config={
+                    "label": st.column_config.TextColumn("Step"),
+                    "leads": st.column_config.NumberColumn("Leads", format="%d"),
+                    "conversion": st.column_config.ProgressColumn(
+                        "From previous", format="%.0f%%", min_value=0, max_value=1),
+                    "rule": st.column_config.TextColumn("Counted as", width="large"),
+                })
+
+        st.divider()
+        st.subheader("Campaigns")
+        st.dataframe(
+            metrics.by_campaign(leads_view), width=STRETCH, hide_index=True,
+            column_config={
+                "campaign_group": st.column_config.TextColumn("Group"),
+                "sheet": st.column_config.TextColumn("Campaign"),
+                "leads": st.column_config.NumberColumn("Leads"),
+                "met": st.column_config.NumberColumn("Met"),
+                "won": st.column_config.NumberColumn("Won"),
+                "lost": st.column_config.NumberColumn("Lost"),
+                "live": st.column_config.NumberColumn("Live"),
+            })
+
+        st.divider()
+        left, right = st.columns(2)
+        with left:
+            st.subheader("Who opens doors")
+            st.caption("Connectors ranked by intros that reached a meeting.")
+            connectors = metrics.top_connectors(leads_view)
+            if connectors.empty:
+                st.caption("No connectors recorded in this filter.")
+            else:
+                st.dataframe(
+                    connectors, width=STRETCH, hide_index=True,
+                    column_config={
+                        "connector": st.column_config.TextColumn("Connector"),
+                        "leads": st.column_config.NumberColumn("Intros"),
+                        "met": st.column_config.NumberColumn("Reached a meeting"),
+                        "hit_rate": st.column_config.NumberColumn(
+                            "Hit rate", format="percent"),
+                    })
+        with right:
+            st.subheader("Furthest along")
+            top = leads_view.sort_values(
+                ["status_rank", "score"], ascending=False).head(15)
+            st.dataframe(
+                top[["name", "firm", "status", "owner", "grade", "check_size"]],
+                width=STRETCH, hide_index=True,
+                column_config={
+                    "name": st.column_config.TextColumn("Lead"),
+                    "firm": st.column_config.TextColumn("Firm"),
+                    "status": st.column_config.TextColumn("Status", width="medium"),
+                    "owner": st.column_config.TextColumn("Owner"),
+                    "grade": st.column_config.TextColumn("Grade", width="small"),
+                    "check_size": st.column_config.NumberColumn(
+                        "Est. check", format="dollar"),
+                })
+
+        st.divider()
+        st.subheader("All leads")
+        st.caption("Edit any cell and save. This is the system of record once you "
+                   "adopt it, so corrections belong here rather than in the workbook.")
+        lead_columns = ["id", "name", "firm", "status", "owner", "campaign_group",
+                        "sheet", "grade", "score", "check_size", "committed",
+                        "connector", "last_updated", "notes"]
+        edited_leads = st.data_editor(
+            leads_view.reindex(columns=lead_columns), key="leads_editor",
+            width=STRETCH, hide_index=True, height=420,
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+                "name": st.column_config.TextColumn("Lead", required=True),
+                "firm": st.column_config.TextColumn("Firm"),
+                "status": st.column_config.TextColumn("Status", width="medium"),
+                "owner": st.column_config.TextColumn("Owner", disabled=True),
+                "campaign_group": st.column_config.TextColumn("Group", disabled=True),
+                "sheet": st.column_config.TextColumn("Campaign", disabled=True),
+                "grade": st.column_config.TextColumn("Grade", width="small"),
+                "score": st.column_config.NumberColumn("Score", format="%.1f"),
+                "check_size": st.column_config.NumberColumn("Est. check", format="dollar"),
+                "committed": st.column_config.NumberColumn("Committed", format="dollar"),
+                "last_updated": st.column_config.DateColumn("Updated", format="YYYY-MM-DD"),
+                "notes": st.column_config.TextColumn("Notes", width="large"),
+            })
+        if st.button("Save lead edits", type="primary"):
+            changed = 0
+            original = leads_view.set_index("id")
+            for _, row in edited_leads.iterrows():
+                if pd.isna(row.get("id")):
+                    continue
+                lead_id = int(row["id"])
+                if lead_id not in original.index:
+                    continue
+                before = original.loc[lead_id]
+                updates = {c: row[c] for c in
+                           ("name", "firm", "status", "grade", "score", "check_size",
+                            "committed", "connector", "notes")
+                           if c in row.index and str(row[c]) != str(before.get(c))}
+                if not updates:
+                    continue
+                # Editing the status re-derives how far the lead has got, so the
+                # funnel stays consistent with what the grid says.
+                if "status" in updates:
+                    updates["status_rank"] = pipeline.rank_of(updates["status"])
+                    updates["terminal"] = pipeline.terminal_kind(updates["status"])
+                sets = ", ".join(f"{k} = ?" for k in updates)
+                with db._WRITE_LOCK, db.session() as conn:
+                    conn.execute(f"UPDATE leads SET {sets}, updated_at = ? WHERE id = ?",
+                                 list(updates.values()) + [db._now(), lead_id])
+                    db.log(conn, "leads", lead_id, "update",
+                           {"fields": sorted(updates)}, "grid")
+                changed += 1
+            st.success(f"Saved {changed} lead(s).") if changed else st.info("Nothing to save.")
+            st.rerun()
 
 
 # --- Conversation log --------------------------------------------------------
@@ -641,13 +846,70 @@ with tab_import:
 
     source_kind = st.radio(
         "Where is it",
-        ["Google Sheet link", "Google Sheet (service account)", "Upload CSV or Excel"],
+        ["Master workbook (multi-sheet)", "Google Sheet link",
+         "Google Sheet (service account)", "Upload CSV or Excel"],
         horizontal=True, label_visibility="collapsed")
 
     frame = st.session_state.get("import_frame")
     source_ref = st.session_state.get("import_ref", "")
 
-    if source_kind == "Google Sheet link":
+    if source_kind == "Master workbook (multi-sheet)":
+        st.caption("For a workbook that tracks one row per lead across many "
+                   "campaign sheets, with a dated column per pipeline stage. "
+                   "Stage dates become the funnel, meeting dates become "
+                   "conversations, and a bundled calendar sheet is loaded too.")
+        upload = st.file_uploader("Workbook", type=["xlsx", "xlsm"], key="wb_upload")
+        if upload is not None:
+            try:
+                if st.session_state.get("wb_name") != upload.name:
+                    st.session_state["wb_preview"] = workbook.preview(upload)
+                    st.session_state["wb_name"] = upload.name
+            except Exception as exc:
+                st.error(f"Could not read that workbook: {exc}")
+
+        summary = st.session_state.get("wb_preview")
+        if summary:
+            st.markdown(f"**Found {len(summary['lead_sheets'])} pipeline sheets**"
+                        + (f" and {summary['calendar_rows']:,} calendar rows"
+                           if summary["calendar_rows"] else ""))
+            st.dataframe(summary["table"], width=STRETCH, hide_index=True,
+                         column_config={
+                             "sheet": st.column_config.TextColumn("Sheet"),
+                             "group": st.column_config.TextColumn("Group"),
+                             "leads": st.column_config.NumberColumn("Rows"),
+                             "stage columns": st.column_config.NumberColumn("Stage cols"),
+                             "unmapped": st.column_config.NumberColumn("Unmapped"),
+                         })
+            if summary["unmapped"]:
+                # Never silently drop a stage we do not understand -- an unmapped
+                # label would quietly sink those leads down the funnel.
+                st.warning("Some stage columns have no mapping and will not count "
+                           "toward the funnel:")
+                for sheet_name, labels in summary["unmapped"].items():
+                    st.caption(f"**{sheet_name}**: {', '.join(labels)}")
+
+            chosen_sheets = st.multiselect(
+                "Sheets to import", summary["lead_sheets"],
+                default=summary["lead_sheets"])
+            with_calendar = st.toggle(
+                "Also import the bundled calendar sheet",
+                value=bool(summary["calendar_rows"]),
+                disabled=not summary["calendar_rows"])
+
+            if st.button("Import workbook", type="primary", disabled=not chosen_sheets):
+                with st.spinner("Reading the workbook…"):
+                    report = workbook.import_workbook(
+                        upload, sheets=chosen_sheets, include_calendar=with_calendar,
+                        source_ref=upload.name)
+                st.success(f"Imported {report.summary()}.")
+                if report.skipped_rows:
+                    st.caption(f"{report.skipped_rows:,} rows had no lead name and "
+                               "were skipped.")
+                for message in report.errors:
+                    st.error(message)
+                st.rerun()
+
+    elif source_kind == "Google Sheet link":
         st.caption("Works when the sheet's link sharing is set to *Anyone with the "
                    "link can view*. Nothing is written back to the sheet.")
         url = st.text_input("Sheet URL",
@@ -705,7 +967,8 @@ with tab_import:
             except Exception as exc:
                 st.error(f"Could not read that file: {exc}")
 
-    if frame is not None and not frame.empty:
+    if (source_kind != "Master workbook (multi-sheet)"
+            and frame is not None and not frame.empty):
         st.divider()
         st.markdown(f"**Loaded {len(frame)} rows** from `{source_ref}`")
         with st.expander("What the sheet looks like"):

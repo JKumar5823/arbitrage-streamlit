@@ -26,7 +26,7 @@ from . import config
 
 _WRITE_LOCK = threading.Lock()
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS people (
@@ -57,6 +57,40 @@ CREATE TABLE IF NOT EXISTS investors (
 CREATE UNIQUE INDEX IF NOT EXISTS ix_investors_name ON investors(name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS ix_investors_domain ON investors(domain);
 
+CREATE TABLE IF NOT EXISTS leads (
+    id            INTEGER PRIMARY KEY,
+    name          TEXT NOT NULL,
+    firm          TEXT,
+    investor_id   INTEGER REFERENCES investors(id) ON DELETE SET NULL,
+    owner_id      INTEGER REFERENCES people(id) ON DELETE SET NULL,
+    campaign      TEXT,
+    campaign_group TEXT,
+    sheet         TEXT,
+    wave          TEXT,
+    title         TEXT,
+    location      TEXT,
+    emails        TEXT,
+    linkedin      TEXT,
+    grade         TEXT,
+    score         REAL,
+    investor_types TEXT,
+    check_size    REAL,
+    check_upper   REAL,
+    committed     REAL,
+    connector     TEXT,
+    status        TEXT,
+    status_rank   INTEGER DEFAULT 0,
+    terminal      TEXT,
+    last_updated  TEXT,
+    notes         TEXT,
+    source_key    TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_leads_source ON leads(source_key);
+CREATE INDEX IF NOT EXISTS ix_leads_sheet ON leads(sheet);
+CREATE INDEX IF NOT EXISTS ix_leads_rank ON leads(status_rank);
+
 CREATE TABLE IF NOT EXISTS conversations (
     id            INTEGER PRIMARY KEY,
     occurred_on   TEXT NOT NULL,
@@ -73,6 +107,11 @@ CREATE TABLE IF NOT EXISTS conversations (
     source        TEXT NOT NULL DEFAULT 'manual',
     source_key    TEXT,
     batch_id      INTEGER REFERENCES import_batches(id) ON DELETE SET NULL,
+    lead_id       INTEGER REFERENCES leads(id) ON DELETE CASCADE,
+    -- 'meeting' rows are conversations that actually happened and drive the
+    -- headline count; 'stage' rows are pipeline transitions and drive the funnel.
+    kind          TEXT NOT NULL DEFAULT 'meeting',
+    stage_rank    INTEGER DEFAULT 0,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
 );
@@ -84,6 +123,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ix_conversations_source
 CREATE INDEX IF NOT EXISTS ix_conversations_date ON conversations(occurred_on);
 CREATE INDEX IF NOT EXISTS ix_conversations_person ON conversations(person_id);
 CREATE INDEX IF NOT EXISTS ix_conversations_investor ON conversations(investor_id);
+CREATE INDEX IF NOT EXISTS ix_conversations_lead ON conversations(lead_id);
+CREATE INDEX IF NOT EXISTS ix_conversations_kind ON conversations(kind);
 
 CREATE TABLE IF NOT EXISTS calendar_events (
     id            INTEGER PRIMARY KEY,
@@ -145,7 +186,14 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 CONVERSATION_FIELDS = [
     "occurred_on", "person_id", "investor_id", "counterpart", "channel",
     "stage", "outcome", "amount", "next_step", "next_step_due", "notes",
-    "source", "source_key", "batch_id",
+    "source", "source_key", "batch_id", "lead_id", "kind", "stage_rank",
+]
+
+LEAD_FIELDS = [
+    "name", "firm", "investor_id", "owner_id", "campaign", "campaign_group",
+    "sheet", "wave", "title", "location", "emails", "linkedin", "grade", "score",
+    "investor_types", "check_size", "check_upper", "committed", "connector",
+    "status", "status_rank", "terminal", "last_updated", "notes", "source_key",
 ]
 
 
@@ -188,11 +236,29 @@ def init_db(path: str | Path | None = None) -> None:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (str(SCHEMA_VERSION),),
         )
+        _migrate(conn)
         for key, value in config.SETTINGS_DEFAULTS.items():
             conn.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
                 (key, json.dumps(value)),
             )
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after a database was first created.
+
+    CREATE TABLE IF NOT EXISTS silently leaves an existing table alone, so new
+    columns have to be added explicitly or an upgraded install would keep
+    failing on them.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(conversations)")}
+    for column, ddl in (
+        ("lead_id", "INTEGER REFERENCES leads(id) ON DELETE CASCADE"),
+        ("kind", "TEXT NOT NULL DEFAULT 'meeting'"),
+        ("stage_rank", "INTEGER DEFAULT 0"),
+    ):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE conversations ADD COLUMN {column} {ddl}")
 
 
 # --- Generic helpers ---------------------------------------------------------
@@ -396,6 +462,58 @@ def find_investor_by_domain(domain: str, path: str | Path | None = None) -> int 
     return int(row["id"]) if row else None
 
 
+# --- Leads -------------------------------------------------------------------
+
+def upsert_lead(conn: sqlite3.Connection, data: Mapping[str, Any]) -> int:
+    """Insert or refresh one lead, keyed on its workbook row.
+
+    Takes an open connection because imports write thousands of these inside a
+    single transaction.
+    """
+    payload = {k: _norm(data.get(k)) for k in LEAD_FIELDS}
+    if not payload.get("name"):
+        raise ValueError("lead name is required")
+    now = _now()
+    row = conn.execute(
+        "SELECT id FROM leads WHERE source_key = ?", (payload["source_key"],)
+    ).fetchone() if payload.get("source_key") else None
+    if row:
+        assignments = ", ".join(f"{k} = ?" for k in LEAD_FIELDS)
+        conn.execute(
+            f"UPDATE leads SET {assignments}, updated_at = ? WHERE id = ?",
+            [payload[k] for k in LEAD_FIELDS] + [now, row["id"]],
+        )
+        return int(row["id"])
+    cols = ", ".join(LEAD_FIELDS + ["created_at", "updated_at"])
+    marks = ", ".join(["?"] * (len(LEAD_FIELDS) + 2))
+    cur = conn.execute(
+        f"INSERT INTO leads({cols}) VALUES({marks})",
+        [payload[k] for k in LEAD_FIELDS] + [now, now],
+    )
+    return int(cur.lastrowid)
+
+
+LEADS_SQL = """
+SELECT l.*, p.name AS owner, i.name AS investor
+FROM leads l
+LEFT JOIN people p ON p.id = l.owner_id
+LEFT JOIN investors i ON i.id = l.investor_id
+ORDER BY l.status_rank DESC, l.name
+"""
+
+
+def list_leads(path: str | Path | None = None) -> pd.DataFrame:
+    df = query_df(LEADS_SQL, path=path)
+    if df.empty:
+        cols = ["id", *LEAD_FIELDS, "created_at", "updated_at", "owner", "investor"]
+        return pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
+    df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    for column in ("check_size", "check_upper", "committed"):
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    df["last_updated"] = pd.to_datetime(df["last_updated"], errors="coerce", format="mixed")
+    return df
+
+
 # --- Conversations -----------------------------------------------------------
 
 def add_conversation(data: Mapping[str, Any], path: str | Path | None = None,
@@ -410,6 +528,10 @@ def _insert_conversation(conn: sqlite3.Connection, data: Mapping[str, Any],
     if not payload.get("occurred_on"):
         raise ValueError("occurred_on is required")
     payload["source"] = payload.get("source") or config.SOURCE_MANUAL
+    # Hand-logged and calendar rows are conversations that happened; only the
+    # workbook importer emits 'stage' transition rows.
+    payload["kind"] = payload.get("kind") or config.KIND_MEETING
+    payload["stage_rank"] = payload.get("stage_rank") or 0
     now = _now()
     cols = ", ".join(CONVERSATION_FIELDS + ["created_at", "updated_at"])
     marks = ", ".join(["?"] * (len(CONVERSATION_FIELDS) + 2))
@@ -474,10 +596,15 @@ SELECT c.*,
        p.name AS person,
        i.name AS investor,
        i.type AS investor_type,
-       i.domain AS investor_domain
+       i.domain AS investor_domain,
+       l.name AS lead,
+       l.campaign AS campaign,
+       l.campaign_group AS campaign_group,
+       l.sheet AS sheet
 FROM conversations c
 LEFT JOIN people p ON p.id = c.person_id
 LEFT JOIN investors i ON i.id = c.investor_id
+LEFT JOIN leads l ON l.id = c.lead_id
 ORDER BY c.occurred_on DESC, c.id DESC
 """
 
@@ -488,7 +615,8 @@ def list_conversations(path: str | Path | None = None) -> pd.DataFrame:
         # Give callers a stable set of columns so downstream code never has to
         # special-case the empty database.
         cols = ["id", *CONVERSATION_FIELDS, "created_at", "updated_at",
-                "person", "investor", "investor_type", "investor_domain"]
+                "person", "investor", "investor_type", "investor_domain",
+                "lead", "campaign", "campaign_group", "sheet"]
         return pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
     df["occurred_on"] = pd.to_datetime(df["occurred_on"], errors="coerce", format="mixed")
     df["next_step_due"] = pd.to_datetime(df["next_step_due"], errors="coerce", format="mixed")
@@ -639,7 +767,7 @@ def counts(path: str | Path | None = None) -> dict[str, int]:
     try:
         return {
             table: conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
-            for table in ("people", "investors", "conversations",
+            for table in ("people", "investors", "leads", "conversations",
                           "calendar_events", "import_batches")
         }
     finally:

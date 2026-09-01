@@ -53,18 +53,24 @@ def clean_domain(value: str | None) -> str:
 
 
 def to_iso(value: Any) -> str | None:
-    """Best-effort conversion of a date-like value to an ISO string."""
+    """Best-effort conversion of a date-like value to an ISO string.
+
+    The null check has to come first. pandas' NaT *is* an instance of
+    datetime, and NaT.isoformat() returns the string "NaT" -- so testing
+    isinstance before nullness turns every empty cell of a datetime column
+    into a truthy "NaT" date.
+    """
     if value is None:
         return None
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
     try:
         if pd.isna(value):
             return None
     except (TypeError, ValueError):
         pass
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
     parsed = pd.to_datetime(value, errors="coerce")
     if parsed is None or pd.isna(parsed):
         return None

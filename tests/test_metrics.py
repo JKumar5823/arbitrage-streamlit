@@ -141,3 +141,31 @@ def test_overdue_next_steps(dbpath):
 
     due = metrics.upcoming_next_steps(frame, today=TODAY)
     assert due.iloc[0]["status"] == "Overdue"
+
+
+# --- Scheduled-but-not-yet-held meetings -------------------------------------
+
+def test_future_meetings_are_not_counted_as_had(dbpath):
+    """A meeting booked for next week is on the books, not in the count."""
+    db.add_conversation({"occurred_on": "2026-08-20"}, path=dbpath)
+    db.add_conversation({"occurred_on": "2026-08-24"}, path=dbpath)
+    db.add_conversation({"occurred_on": "2026-09-30"}, path=dbpath)   # future
+    frame = db.list_conversations(dbpath)
+
+    kpis = metrics.compute_kpis(frame, today=TODAY)
+    assert kpis.total == 2
+    assert kpis.upcoming == 1
+
+
+def test_split_by_today(dbpath):
+    db.add_conversation({"occurred_on": "2026-08-01"}, path=dbpath)
+    db.add_conversation({"occurred_on": "2026-12-01"}, path=dbpath)
+    had, ahead = metrics.split_by_today(db.list_conversations(dbpath), today=TODAY)
+    assert len(had) == 1 and len(ahead) == 1
+
+
+def test_kpis_with_only_future_meetings(dbpath):
+    db.add_conversation({"occurred_on": "2026-12-01"}, path=dbpath)
+    kpis = metrics.compute_kpis(db.list_conversations(dbpath), today=TODAY)
+    assert kpis.total == 0
+    assert kpis.upcoming == 1

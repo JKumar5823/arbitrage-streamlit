@@ -23,7 +23,7 @@ def app(tmp_path, monkeypatch):
 def test_runs_with_no_data(app):
     app.run()
     assert not app.exception
-    assert len(app.tabs) == 6
+    assert len(app.tabs) == 7
     assert app.metric[0].value == "0"
 
 
