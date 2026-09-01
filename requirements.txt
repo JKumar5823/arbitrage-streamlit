@@ -1,5 +1,20 @@
-streamlit
-pandas
-beautifulsoup4
-requests
-openpyxl
+# Core dashboard
+streamlit>=1.40
+pandas>=2.0
+altair>=5.0
+openpyxl>=3.1
+python-dateutil>=2.8
+requests>=2.31
+
+# Calendar ingestion (ICS feeds)
+icalendar>=5.0
+
+# Optional: Google Calendar / Google Sheets API access via a service account.
+# The app runs without these; it falls back to ICS feeds, public sheet links
+# and file uploads, and only imports them when you pick an API source.
+gspread>=6.0
+google-auth>=2.30
+google-api-python-client>=2.130
+
+# Legacy arbitrage scraper (legacy_arbitrage_app.py)
+beautifulsoup4>=4.12

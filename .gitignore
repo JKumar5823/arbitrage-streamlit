@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local system of record and anything exported from it
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Never commit credentials
+.streamlit/secrets.toml
+*service-account*.json
